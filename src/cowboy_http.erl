@@ -377,7 +377,7 @@ after_parse({more, State}) ->
 
 update_flow(fin, _, State) ->
 	State#state{flow=infinity};
-update_flow(nofin, Data, State=#state{flow=Flow0}) ->
+update_flow(nofin, Data, State=#state{flow=Flow0}) when Flow0 =/= infinity ->
 	State#state{flow=Flow0 - byte_size(Data)}.
 
 %% Request-line.
