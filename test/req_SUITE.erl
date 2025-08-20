@@ -1,4 +1,4 @@
-%% Copyright (c) 2016-2017, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) Loïc Hoguin <essen@ninenines.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
 %% purpose with or without fee is hereby granted, provided that the above
@@ -46,7 +46,7 @@ init_per_group(Name, Config) ->
 	cowboy_test:init_common_groups(Name, Config, ?MODULE).
 
 end_per_group(Name, _) ->
-	cowboy:stop_listener(Name).
+	cowboy_test:stop_group(Name).
 
 %% Routes.
 
@@ -57,13 +57,16 @@ init_dispatch(Config) ->
 		{"/resp/:key[/:arg]", resp_h, []},
 		{"/multipart[/:key]", multipart_h, []},
 		{"/args/:key/:arg[/:default]", echo_h, []},
-		{"/crash/:key/period", echo_h, #{length => 999999999, period => 1000, crash => true}},
+		{"/crash/:key/period", echo_h,
+			#{length => 999999999, period => 1000, timeout => 5000, crash => true}},
 		{"/no-opts/:key", echo_h, #{crash => true}},
 		{"/opts/:key/length", echo_h, #{length => 1000}},
 		{"/opts/:key/period", echo_h, #{length => 999999999, period => 2000}},
 		{"/opts/:key/timeout", echo_h, #{timeout => 1000, crash => true}},
 		{"/100-continue/:key", echo_h, []},
 		{"/full/:key", echo_h, []},
+		{"/auto-sync/:key", echo_h, []},
+		{"/auto-async/:key", echo_h, []},
 		{"/spawn/:key", echo_h, []},
 		{"/no/:key", echo_h, []},
 		{"/direct/:key/[...]", echo_h, []},
@@ -104,13 +107,17 @@ do_get(Path, Config) ->
 do_get(Path, Headers, Config) ->
 	ConnPid = gun_open(Config),
 	Ref = gun:get(ConnPid, Path, [{<<"accept-encoding">>, <<"gzip">>}|Headers]),
-	{response, IsFin, Status, RespHeaders} = gun:await(ConnPid, Ref, infinity),
-	{ok, RespBody} = case IsFin of
-		nofin -> gun:await_body(ConnPid, Ref, infinity);
-		fin -> {ok, <<>>}
-	end,
-	gun:close(ConnPid),
-	{Status, RespHeaders, do_decode(RespHeaders, RespBody)}.
+	case gun:await(ConnPid, Ref, infinity) of
+		{response, IsFin, Status, RespHeaders} ->
+			{ok, RespBody} = case IsFin of
+				nofin -> gun:await_body(ConnPid, Ref, infinity);
+				fin -> {ok, <<>>}
+			end,
+			gun:close(ConnPid),
+			{Status, RespHeaders, do_decode(RespHeaders, RespBody)};
+		{error, {stream_error, Error}} ->
+			Error
+	end.
 
 do_get_body(Path, Config) ->
 	do_get_body(Path, [], Config).
@@ -139,7 +146,9 @@ do_get_inform(Path, Config) ->
 				fin -> {ok, <<>>}
 			end,
 			gun:close(ConnPid),
-			{InfoStatus, InfoHeaders, RespStatus, RespHeaders, do_decode(RespHeaders, RespBody)}
+			{InfoStatus, InfoHeaders, RespStatus, RespHeaders, do_decode(RespHeaders, RespBody)};
+		{error, {stream_error, Error}} ->
+			Error
 	end.
 
 do_decode(Headers, Body) ->
@@ -181,25 +190,20 @@ bindings(Config) ->
 cert(Config) ->
 	case config(type, Config) of
 		tcp -> doc("TLS certificates can only be provided over TLS.");
-		ssl -> do_cert(Config)
+		ssl -> do_cert(Config);
+		quic -> do_cert(Config)
 	end.
 
-do_cert(Config0) ->
+do_cert(Config) ->
 	doc("A client TLS certificate was provided."),
-	{CaCert, Cert, Key} = ct_helper:make_certs(),
-	Config = [{tls_opts, [
-		{cert, Cert},
-		{key, Key},
-		{cacerts, [CaCert]}
-	]}|Config0],
 	Cert = do_get_body("/cert", Config),
 	Cert = do_get_body("/direct/cert", Config),
 	ok.
 
 cert_undefined(Config) ->
 	doc("No client TLS certificate was provided."),
-	<<"undefined">> = do_get_body("/cert", Config),
-	<<"undefined">> = do_get_body("/direct/cert", Config),
+	<<"undefined">> = do_get_body("/cert", [{no_cert, true}|Config]),
+	<<"undefined">> = do_get_body("/direct/cert", [{no_cert, true}|Config]),
 	ok.
 
 header(Config) ->
@@ -239,8 +243,10 @@ match_cookies(Config) ->
 	<<"#{}">> = do_get_body("/match/cookies", [{<<"cookie">>, "a=b; c=d"}], Config),
 	<<"#{a => <<\"b\">>}">> = do_get_body("/match/cookies/a", [{<<"cookie">>, "a=b; c=d"}], Config),
 	<<"#{c => <<\"d\">>}">> = do_get_body("/match/cookies/c", [{<<"cookie">>, "a=b; c=d"}], Config),
-	<<"#{a => <<\"b\">>,c => <<\"d\">>}">> = do_get_body("/match/cookies/a/c",
-		[{<<"cookie">>, "a=b; c=d"}], Config),
+	case do_get_body("/match/cookies/a/c", [{<<"cookie">>, "a=b; c=d"}], Config) of
+		<<"#{a => <<\"b\">>,c => <<\"d\">>}">> -> ok;
+		<<"#{c => <<\"d\">>,a => <<\"b\">>}">> -> ok
+	end,
 	%% Ensure match errors result in a 400 response.
 	{400, _, _} = do_get("/match/cookies/a/c",
 		[{<<"cookie">>, "a=b"}], Config),
@@ -253,11 +259,21 @@ match_qs(Config) ->
 	<<"#{}">> = do_get_body("/match/qs?a=b&c=d", Config),
 	<<"#{a => <<\"b\">>}">> = do_get_body("/match/qs/a?a=b&c=d", Config),
 	<<"#{c => <<\"d\">>}">> = do_get_body("/match/qs/c?a=b&c=d", Config),
-	<<"#{a => <<\"b\">>,c => <<\"d\">>}">> = do_get_body("/match/qs/a/c?a=b&c=d", Config),
-	<<"#{a => <<\"b\">>,c => true}">> = do_get_body("/match/qs/a/c?a=b&c", Config),
-	<<"#{a => true,c => <<\"d\">>}">> = do_get_body("/match/qs/a/c?a&c=d", Config),
+	case do_get_body("/match/qs/a/c?a=b&c=d", Config) of
+		<<"#{a => <<\"b\">>,c => <<\"d\">>}">> -> ok;
+		<<"#{c => <<\"d\">>,a => <<\"b\">>}">> -> ok
+	end,
+	case do_get_body("/match/qs/a/c?a=b&c", Config) of
+		<<"#{a => <<\"b\">>,c => true}">> -> ok;
+		<<"#{c => true,a => <<\"b\">>}">> -> ok
+	end,
+	case do_get_body("/match/qs/a/c?a&c=d", Config) of
+		<<"#{a => true,c => <<\"d\">>}">> -> ok;
+		<<"#{c => <<\"d\">>,a => true}">> -> ok
+	end,
 	%% Ensure match errors result in a 400 response.
 	{400, _, _} = do_get("/match/qs/a/c?a=b", [], Config),
+	{400, _, _} = do_get("/match/qs_with_constraints", [], Config),
 	%% This function is tested more extensively through unit tests.
 	ok.
 
@@ -308,7 +324,7 @@ filter_then_parse_cookies(Config) ->
 			[{<<"cookie">>, "bad name=strawberry"}], Config),
 	<<"[{<<\"cake\">>,<<\"strawberry\">>}]">>
 		= do_get_body("/filter_then_parse_cookies",
-			[{<<"cookie">>, "bad name=strawberry; cake=strawberry"}], Config),
+			[{<<"cookie">>, "bad name=strawberry; another bad name=strawberry; cake=strawberry"}], Config),
 	<<"[]">>
 		= do_get_body("/filter_then_parse_cookies",
 			[{<<"cookie">>, "Blocked by http://www.example.com/upgrade-to-remove"}], Config),
@@ -377,7 +393,8 @@ port(Config) ->
 	Port = do_get_body("/direct/port", Config),
 	ExpectedPort = case config(type, Config) of
 		tcp -> <<"80">>;
-		ssl -> <<"443">>
+		ssl -> <<"443">>;
+		quic -> <<"443">>
 	end,
 	ExpectedPort = do_get_body("/port", [{<<"host">>, <<"localhost">>}], Config),
 	ExpectedPort = do_get_body("/direct/port", [{<<"host">>, <<"localhost">>}], Config),
@@ -403,7 +420,8 @@ do_scheme(Path, Config) ->
 	Transport = config(type, Config),
 	case do_get_body(Path, Config) of
 		<<"http">> when Transport =:= tcp -> ok;
-		<<"https">> when Transport =:= ssl -> ok
+		<<"https">> when Transport =:= ssl -> ok;
+		<<"https">> when Transport =:= quic -> ok
 	end.
 
 sock(Config) ->
@@ -416,7 +434,8 @@ uri(Config) ->
 	doc("Request URI building/modification."),
 	Scheme = case config(type, Config) of
 		tcp -> <<"http">>;
-		ssl -> <<"https">>
+		ssl -> <<"https">>;
+		quic -> <<"https">>
 	end,
 	SLen = byte_size(Scheme),
 	Port = integer_to_binary(config(port, Config)),
@@ -450,7 +469,8 @@ do_version(Path, Config) ->
 	Protocol = config(protocol, Config),
 	case do_get_body(Path, Config) of
 		<<"HTTP/1.1">> when Protocol =:= http -> ok;
-		<<"HTTP/2">> when Protocol =:= http2 -> ok
+		<<"HTTP/2">> when Protocol =:= http2 -> ok;
+		<<"HTTP/3">> when Protocol =:= http3 -> ok
 	end.
 
 %% Tests: Request body.
@@ -504,11 +524,19 @@ read_body_period(Config) ->
 	%% for 2 seconds. The test succeeds if we get some of the data back
 	%% (meaning the function will have returned after the period ends).
 	gun:data(ConnPid, Ref, nofin, Body),
-	{response, nofin, 200, _} = gun:await(ConnPid, Ref, infinity),
-	{data, _, Data} = gun:await(ConnPid, Ref, infinity),
-	%% We expect to read at least some data.
-	true = Data =/= <<>>,
-	gun:close(ConnPid).
+	Response = gun:await(ConnPid, Ref, infinity),
+	case Response of
+		{response, nofin, 200, _} ->
+			{data, _, Data} = gun:await(ConnPid, Ref, infinity),
+			%% We expect to read at least some data.
+			true = Data =/= <<>>,
+			gun:close(ConnPid);
+		%% We got a crash, likely because the environment
+		%% was overloaded and the timeout triggered. Try again.
+		{response, _, 500, _} ->
+			gun:close(ConnPid),
+			read_body_period(Config)
+	end.
 
 %% We expect a crash.
 do_read_body_timeout(Path, Body, Config) ->
@@ -516,8 +544,20 @@ do_read_body_timeout(Path, Body, Config) ->
 	Ref = gun:headers(ConnPid, "POST", Path, [
 		{<<"content-length">>, integer_to_binary(byte_size(Body))}
 	]),
-	{response, _, 500, _} = gun:await(ConnPid, Ref, infinity),
+	case gun:await(ConnPid, Ref, infinity) of
+		{response, _, 500, _} ->
+			ok;
+		%% See do_maybe_h3_error comment for details.
+		{error, {stream_error, {stream_error, h3_internal_error, _}}} ->
+			ok
+	end,
 	gun:close(ConnPid).
+
+read_body_auto(Config) ->
+	doc("Read the request body using auto mode."),
+	<<0:80000000>> = do_body("POST", "/auto-sync/read_body", [], <<0:80000000>>, Config),
+	<<0:80000000>> = do_body("POST", "/auto-async/read_body", [], <<0:80000000>>, Config),
+	ok.
 
 read_body_spawn(Config) ->
 	doc("Confirm we can use cowboy_req:read_body/1,2 from another process."),
@@ -549,7 +589,8 @@ do_read_body_expect_100_continue(Path, Config) ->
 		fin -> {ok, <<>>}
 	end,
 	gun:close(ConnPid),
-	do_decode(RespHeaders, RespBody).
+	do_decode(RespHeaders, RespBody),
+	ok.
 
 read_urlencoded_body(Config) ->
 	doc("application/x-www-form-urlencoded request body."),
@@ -576,8 +617,20 @@ do_read_urlencoded_body_too_large(Path, Body, Config) ->
 		{<<"content-length">>, integer_to_binary(iolist_size(Body))}
 	]),
 	gun:data(ConnPid, Ref, fin, Body),
-	{response, _, 413, _} = gun:await(ConnPid, Ref, infinity),
-	gun:close(ConnPid).
+	Response = gun:await(ConnPid, Ref, infinity),
+	gun:close(ConnPid),
+	case Response of
+		{response, _, 413, _} ->
+			ok;
+		%% We got the wrong crash, likely because the environment
+		%% was overloaded and the timeout triggered. Try again.
+		{response, _, 408, _} ->
+			do_read_urlencoded_body_too_large(Path, Body, Config);
+		%% Timing issues make it possible for the connection to be
+		%% closed before the data went through. We retry.
+		{error, {stream_error, {closed, {error,closed}}}} ->
+			do_read_urlencoded_body_too_large(Path, Body, Config)
+	end.
 
 read_urlencoded_body_too_long(Config) ->
 	doc("application/x-www-form-urlencoded request body sent too slow. "
@@ -592,25 +645,37 @@ do_read_urlencoded_body_too_long(Path, Body, Config) ->
 		{<<"content-length">>, integer_to_binary(byte_size(Body) * 2)}
 	]),
 	gun:data(ConnPid, Ref, nofin, Body),
-	{response, _, 408, RespHeaders} = gun:await(ConnPid, Ref, infinity),
-	_ = case config(protocol, Config) of
-		http ->
+	Protocol = config(protocol, Config),
+	case gun:await(ConnPid, Ref, infinity) of
+		{response, _, 408, RespHeaders} when Protocol =:= http ->
 			%% 408 error responses should close HTTP/1.1 connections.
-			{_, <<"close">>} = lists:keyfind(<<"connection">>, 1, RespHeaders);
-		http2 ->
-			ok
-	end,
-	gun:close(ConnPid).
+			{_, <<"close">>} = lists:keyfind(<<"connection">>, 1, RespHeaders),
+			gun:close(ConnPid);
+		{response, _, 408, _} when Protocol =:= http2; Protocol =:= http3 ->
+			gun:close(ConnPid);
+		%% We must have hit the timeout due to busy CI environment. Retry.
+		{response, _, 500, _} ->
+			gun:close(ConnPid),
+			do_read_urlencoded_body_too_long(Path, Body, Config)
+	end.
 
 read_and_match_urlencoded_body(Config) ->
 	doc("Read and match an application/x-www-form-urlencoded request body."),
 	<<"#{}">> = do_body("POST", "/match/body_qs", [], "a=b&c=d", Config),
 	<<"#{a => <<\"b\">>}">> = do_body("POST", "/match/body_qs/a", [], "a=b&c=d", Config),
 	<<"#{c => <<\"d\">>}">> = do_body("POST", "/match/body_qs/c", [], "a=b&c=d", Config),
-	<<"#{a => <<\"b\">>,c => <<\"d\">>}">>
-		= do_body("POST", "/match/body_qs/a/c", [], "a=b&c=d", Config),
-	<<"#{a => <<\"b\">>,c => true}">> = do_body("POST", "/match/body_qs/a/c", [], "a=b&c", Config),
-	<<"#{a => true,c => <<\"d\">>}">> = do_body("POST", "/match/body_qs/a/c", [], "a&c=d", Config),
+	case do_body("POST", "/match/body_qs/a/c", [], "a=b&c=d", Config) of
+		<<"#{a => <<\"b\">>,c => <<\"d\">>}">> -> ok;
+		<<"#{c => <<\"d\">>,a => <<\"b\">>}">> -> ok
+	end,
+	case do_body("POST", "/match/body_qs/a/c", [], "a=b&c", Config) of
+		<<"#{a => <<\"b\">>,c => true}">> -> ok;
+		<<"#{c => true,a => <<\"b\">>}">> -> ok
+	end,
+	case do_body("POST", "/match/body_qs/a/c", [], "a&c=d", Config) of
+		<<"#{a => true,c => <<\"d\">>}">> -> ok;
+		<<"#{c => <<\"d\">>,a => true}">> -> ok
+	end,
 	%% Ensure match errors result in a 400 response.
 	{400, _} = do_body_error("POST", "/match/body_qs/a/c", [], "a=b", Config),
 	%% Ensure parse errors result in a 400 response.
@@ -768,18 +833,18 @@ set_resp_cookie(Config) ->
 	doc("Response using set_resp_cookie."),
 	%% Single cookie, no options.
 	{200, Headers1, _} = do_get("/resp/set_resp_cookie3", Config),
-	{_, <<"mycookie=myvalue; Version=1">>}
+	{_, <<"mycookie=myvalue">>}
 		= lists:keyfind(<<"set-cookie">>, 1, Headers1),
 	%% Single cookie, with options.
 	{200, Headers2, _} = do_get("/resp/set_resp_cookie4", Config),
-	{_, <<"mycookie=myvalue; Version=1; Path=/resp/set_resp_cookie4">>}
+	{_, <<"mycookie=myvalue; Path=/resp/set_resp_cookie4">>}
 		= lists:keyfind(<<"set-cookie">>, 1, Headers2),
 	%% Multiple cookies.
 	{200, Headers3, _} = do_get("/resp/set_resp_cookie3/multiple", Config),
 	[_, _] = [H || H={<<"set-cookie">>, _} <- Headers3],
 	%% Overwrite previously set cookie.
 	{200, Headers4, _} = do_get("/resp/set_resp_cookie3/overwrite", Config),
-	{_, <<"mycookie=overwrite; Version=1">>}
+	{_, <<"mycookie=overwrite">>}
 		= lists:keyfind(<<"set-cookie">>, 1, Headers4),
 	ok.
 
@@ -787,13 +852,22 @@ set_resp_header(Config) ->
 	doc("Response using set_resp_header."),
 	{200, Headers, <<"OK">>} = do_get("/resp/set_resp_header", Config),
 	true = lists:keymember(<<"content-type">>, 1, Headers),
+	%% The set-cookie header is special. set_resp_cookie must be used.
+	{500, _, _} = do_maybe_h3_error3(do_get("/resp/set_resp_header_cookie", Config)),
 	ok.
 
 set_resp_headers(Config) ->
 	doc("Response using set_resp_headers."),
-	{200, Headers, <<"OK">>} = do_get("/resp/set_resp_headers", Config),
-	true = lists:keymember(<<"content-type">>, 1, Headers),
-	true = lists:keymember(<<"content-encoding">>, 1, Headers),
+	{200, Headers1, <<"OK">>} = do_get("/resp/set_resp_headers", Config),
+	true = lists:keymember(<<"content-type">>, 1, Headers1),
+	true = lists:keymember(<<"content-encoding">>, 1, Headers1),
+	{200, Headers2, <<"OK">>} = do_get("/resp/set_resp_headers_list", Config),
+	true = lists:keymember(<<"content-type">>, 1, Headers2),
+	true = lists:keymember(<<"content-encoding">>, 1, Headers2),
+	{_, <<"one, two">>} = lists:keyfind(<<"test-header">>, 1, Headers2),
+	%% The set-cookie header is special. set_resp_cookie must be used.
+	{500, _, _} = do_maybe_h3_error3(do_get("/resp/set_resp_headers_cookie", Config)),
+	{500, _, _} = do_maybe_h3_error3(do_get("/resp/set_resp_headers_list_cookie", Config)),
 	ok.
 
 resp_header(Config) ->
@@ -855,22 +929,52 @@ delete_resp_header(Config) ->
 	false = lists:keymember(<<"content-type">>, 1, Headers),
 	ok.
 
+%% Data may be lost due to how RESET_STREAM QUIC frame works.
+%% Because there is ongoing work for a better way to reset streams
+%% (https://www.ietf.org/archive/id/draft-ietf-quic-reliable-stream-reset-03.html)
+%% we convert the error to a 500 to keep the tests more explicit
+%% at what we expect.
+%% @todo When RESET_STREAM_AT gets added we can remove this function.
+do_maybe_h3_error2({stream_error, h3_internal_error, _}) -> {500, []};
+do_maybe_h3_error2(Result) -> Result.
+
+do_maybe_h3_error3({stream_error, h3_internal_error, _}) -> {500, [], <<>>};
+do_maybe_h3_error3(Result) -> Result.
+
 inform2(Config) ->
 	doc("Informational response(s) without headers, followed by the real response."),
 	{102, [], 200, _, _} = do_get_inform("/resp/inform2/102", Config),
 	{102, [], 200, _, _} = do_get_inform("/resp/inform2/binary", Config),
-	{500, _} = do_get_inform("/resp/inform2/error", Config),
+	{500, _} = do_maybe_h3_error2(do_get_inform("/resp/inform2/error", Config)),
 	{102, [], 200, _, _} = do_get_inform("/resp/inform2/twice", Config),
-	ok.
+	%% With HTTP/1.1 and HTTP/2 we will not get an error.
+	%% With HTTP/3 however the stream will occasionally
+	%% be reset before Gun receives the response.
+	case do_get_inform("/resp/inform2/after_reply", Config) of
+		{200, _} ->
+			ok;
+		{stream_error, h3_internal_error, _} ->
+			ok
+	end.
 
 inform3(Config) ->
 	doc("Informational response(s) with headers, followed by the real response."),
 	Headers = [{<<"ext-header">>, <<"ext-value">>}],
 	{102, Headers, 200, _, _} = do_get_inform("/resp/inform3/102", Config),
 	{102, Headers, 200, _, _} = do_get_inform("/resp/inform3/binary", Config),
-	{500, _} = do_get_inform("/resp/inform3/error", Config),
+	{500, _} = do_maybe_h3_error2(do_get_inform("/resp/inform3/error", Config)),
+	%% The set-cookie header is special. set_resp_cookie must be used.
+	{500, _} = do_maybe_h3_error2(do_get_inform("/resp/inform3/set_cookie", Config)),
 	{102, Headers, 200, _, _} = do_get_inform("/resp/inform3/twice", Config),
-	ok.
+	%% With HTTP/1.1 and HTTP/2 we will not get an error.
+	%% With HTTP/3 however the stream will occasionally
+	%% be reset before Gun receives the response.
+	case do_get_inform("/resp/inform3/after_reply", Config) of
+		{200, _} ->
+			ok;
+		{stream_error, h3_internal_error, _} ->
+			ok
+	end.
 
 reply2(Config) ->
 	doc("Response with default headers and no body."),
@@ -878,9 +982,8 @@ reply2(Config) ->
 	{201, _, _} = do_get("/resp/reply2/201", Config),
 	{404, _, _} = do_get("/resp/reply2/404", Config),
 	{200, _, _} = do_get("/resp/reply2/binary", Config),
-	{500, _, _} = do_get("/resp/reply2/error", Config),
-	%% @todo We want to crash when reply or stream_reply is called twice.
-	%% How to test this properly? This isn't enough.
+	{500, _, _} = do_maybe_h3_error3(do_get("/resp/reply2/error", Config)),
+	%% @todo How to test this properly? This isn't enough.
 	{200, _, _} = do_get("/resp/reply2/twice", Config),
 	ok.
 
@@ -892,7 +995,9 @@ reply3(Config) ->
 	true = lists:keymember(<<"content-type">>, 1, Headers2),
 	{404, Headers3, _} = do_get("/resp/reply3/404", Config),
 	true = lists:keymember(<<"content-type">>, 1, Headers3),
-	{500, _, _} = do_get("/resp/reply3/error", Config),
+	{500, _, _} = do_maybe_h3_error3(do_get("/resp/reply3/error", Config)),
+	%% The set-cookie header is special. set_resp_cookie must be used.
+	{500, _, _} = do_maybe_h3_error3(do_get("/resp/reply3/set_cookie", Config)),
 	ok.
 
 reply4(Config) ->
@@ -900,10 +1005,10 @@ reply4(Config) ->
 	{200, _, <<"OK">>} = do_get("/resp/reply4/200", Config),
 	{201, _, <<"OK">>} = do_get("/resp/reply4/201", Config),
 	{404, _, <<"OK">>} = do_get("/resp/reply4/404", Config),
-	{500, _, _} = do_get("/resp/reply4/error", Config),
+	{500, _, _} = do_maybe_h3_error3(do_get("/resp/reply4/error", Config)),
+	%% The set-cookie header is special. set_resp_cookie must be used.
+	{500, _, _} = do_maybe_h3_error3(do_get("/resp/reply4/set_cookie", Config)),
 	ok.
-
-%% @todo Crash when stream_reply is called twice.
 
 stream_reply2(Config) ->
 	doc("Response with default headers and streamed body."),
@@ -912,8 +1017,36 @@ stream_reply2(Config) ->
 	{201, _, Body} = do_get("/resp/stream_reply2/201", Config),
 	{404, _, Body} = do_get("/resp/stream_reply2/404", Config),
 	{200, _, Body} = do_get("/resp/stream_reply2/binary", Config),
-	{500, _, _} = do_get("/resp/stream_reply2/error", Config),
+	{500, _, _} = do_maybe_h3_error3(do_get("/resp/stream_reply2/error", Config)),
 	ok.
+
+stream_reply2_twice(Config) ->
+	doc("Attempting to stream a response twice results in a crash."),
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, "/resp/stream_reply2/twice",
+		[{<<"accept-encoding">>, <<"gzip">>}]),
+	{response, nofin, 200, _} = gun:await(ConnPid, Ref, infinity),
+	Protocol = config(protocol, Config),
+	Flavor = config(flavor, Config),
+	case {Protocol, Flavor, gun:await_body(ConnPid, Ref, infinity)} of
+		%% In HTTP/1.1 we cannot propagate an error at that point.
+		%% The response will simply not have a body.
+		{http, vanilla, {ok, <<>>}} ->
+			ok;
+		%% When compression was used we do get gzip headers. But
+		%% we do not have any data in the zlib stream.
+		{http, compress, {ok, Data}} ->
+			Z = zlib:open(),
+			zlib:inflateInit(Z, 31),
+			0 = iolist_size(zlib:inflate(Z, Data)),
+			ok;
+		%% In HTTP/2 and HTTP/3 the stream gets reset with an appropriate error.
+		{http2, _, {error, {stream_error, {stream_error, internal_error, _}}}} ->
+			ok;
+		{http3, _, {error, {stream_error, {stream_error, h3_internal_error, _}}}} ->
+			ok
+	end,
+	gun:close(ConnPid).
 
 stream_reply3(Config) ->
 	doc("Response with additional headers and streamed body."),
@@ -924,7 +1057,9 @@ stream_reply3(Config) ->
 	true = lists:keymember(<<"content-type">>, 1, Headers2),
 	{404, Headers3, Body} = do_get("/resp/stream_reply3/404", Config),
 	true = lists:keymember(<<"content-type">>, 1, Headers3),
-	{500, _, _} = do_get("/resp/stream_reply3/error", Config),
+	{500, _, _} = do_maybe_h3_error3(do_get("/resp/stream_reply3/error", Config)),
+	%% The set-cookie header is special. set_resp_cookie must be used.
+	{500, _, _} = do_maybe_h3_error3(do_get("/resp/stream_reply3/set_cookie", Config)),
 	ok.
 
 stream_body_fin0(Config) ->
@@ -1008,8 +1143,11 @@ stream_body_content_length_nofin_error(Config) ->
 					end
 			end;
 		http2 ->
-			%% @todo HTTP2 should have the same content-length checks
-			ok
+			%% @todo HTTP/2 should have the same content-length checks.
+			{skip, "Implement the test for HTTP/2."};
+		http3 ->
+			%% @todo HTTP/3 should have the same content-length checks.
+			{skip, "Implement the test for HTTP/3."}
 	end.
 
 stream_body_concurrent(Config) ->
@@ -1104,6 +1242,35 @@ stream_trailers_no_te(Config) ->
 	<<"Hello world!">> = do_decode(RespHeaders, RespBody),
 	gun:close(ConnPid).
 
+stream_trailers_set_cookie(Config) ->
+	doc("Trying to send set-cookie in trailers should result in a crash."),
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, "/resp/stream_trailers/set_cookie", [
+		{<<"accept-encoding">>, <<"gzip">>},
+		{<<"te">>, <<"trailers">>}
+	]),
+	Protocol = config(protocol, Config),
+	case gun:await(ConnPid, Ref, infinity) of
+		{response, nofin, 200, _} when Protocol =:= http ->
+			%% Trailers are not sent because of the stream error.
+			{ok, _Body} = gun:await_body(ConnPid, Ref, infinity),
+			{error, timeout} = gun:await_body(ConnPid, Ref, 1000),
+			ok;
+		{response, nofin, 200, _} when Protocol =:= http2 ->
+			{error, {stream_error, {stream_error, internal_error, _}}}
+				= gun:await_body(ConnPid, Ref, infinity),
+			ok;
+		{response, nofin, 200, _} when Protocol =:= http3 ->
+			{error, {stream_error, {stream_error, h3_internal_error, _}}}
+				= gun:await_body(ConnPid, Ref, infinity),
+			ok;
+		%% The RST_STREAM arrived before the start of the response.
+		%% See maybe_h3_error comment for details.
+		{error, {stream_error, {stream_error, h3_internal_error, _}}} when Protocol =:= http3 ->
+			ok
+	end,
+	gun:close(ConnPid).
+
 do_trailers(Path, Config) ->
 	ConnPid = gun_open(Config),
 	Ref = gun:get(ConnPid, Path, [
@@ -1127,26 +1294,45 @@ do_trailers(Path, Config) ->
 push(Config) ->
 	case config(protocol, Config) of
 		http -> do_push_http("/resp/push", Config);
-		http2 -> do_push_http2(Config)
+		http2 -> do_push_http2(Config);
+		http3 -> {skip, "Implement server push for HTTP/3."}
 	end.
+
+push_after_reply(Config) ->
+	doc("Trying to push a response after the final response results in a crash."),
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, "/resp/push/after_reply", []),
+	%% With HTTP/1.1 and HTTP/2 we will not get an error.
+	%% With HTTP/3 however the stream will occasionally
+	%% be reset before Gun receives the response.
+	case gun:await(ConnPid, Ref, infinity) of
+		{response, fin, 200, _} ->
+			ok;
+		{error, {stream_error, {stream_error, h3_internal_error, _}}} ->
+			ok
+	end,
+	gun:close(ConnPid).
 
 push_method(Config) ->
 	case config(protocol, Config) of
 		http -> do_push_http("/resp/push/method", Config);
-		http2 -> do_push_http2_method(Config)
+		http2 -> do_push_http2_method(Config);
+		http3 -> {skip, "Implement server push for HTTP/3."}
 	end.
 
 
 push_origin(Config) ->
 	case config(protocol, Config) of
 		http -> do_push_http("/resp/push/origin", Config);
-		http2 -> do_push_http2_origin(Config)
+		http2 -> do_push_http2_origin(Config);
+		http3 -> {skip, "Implement server push for HTTP/3."}
 	end.
 
 push_qs(Config) ->
 	case config(protocol, Config) of
 		http -> do_push_http("/resp/push/qs", Config);
-		http2 -> do_push_http2_qs(Config)
+		http2 -> do_push_http2_qs(Config);
+		http3 -> {skip, "Implement server push for HTTP/3."}
 	end.
 
 do_push_http(Path, Config) ->
@@ -1154,7 +1340,7 @@ do_push_http(Path, Config) ->
 	ConnPid = gun_open(Config),
 	Ref = gun:get(ConnPid, Path, []),
 	{response, fin, 200, _} = gun:await(ConnPid, Ref, infinity),
-	ok.
+	gun:close(ConnPid).
 
 do_push_http2(Config) ->
 	doc("Pushed responses."),

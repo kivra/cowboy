@@ -1,4 +1,4 @@
-%% Copyright (c) 2016-2017, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) Loïc Hoguin <essen@ninenines.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
 %% purpose with or without fee is hereby granted, provided that the above
@@ -33,19 +33,9 @@ start_link(Ref, Transport, Opts) ->
 
 -spec connection_process(pid(), ranch:ref(), module(), cowboy:opts()) -> ok.
 connection_process(Parent, Ref, Transport, Opts) ->
-	ProxyInfo = case maps:get(proxy_header, Opts, false) of
-		true ->
-			{ok, ProxyInfo0} = ranch:recv_proxy_header(Ref, 1000),
-			ProxyInfo0;
-		false ->
-			undefined
-	end,
+	ProxyInfo = get_proxy_info(Ref, Opts),
 	{ok, Socket} = ranch:handshake(Ref),
 	%% Use cowboy_http2 directly only when 'http' is missing.
-	%% Otherwise switch to cowboy_http2 from cowboy_http.
-	%%
-	%% @todo Extend this option to cowboy_tls and allow disabling
-	%% the switch to cowboy_http2 in cowboy_http. Also document it.
 	Protocol = case maps:get(protocols, Opts, [http2, http]) of
 		[http2] -> cowboy_http2;
 		[_|_] -> cowboy_http
@@ -58,3 +48,11 @@ init(Parent, Ref, Socket, Transport, ProxyInfo, Opts, Protocol) ->
 		supervisor -> process_flag(trap_exit, true)
 	end,
 	Protocol:init(Parent, Ref, Socket, Transport, ProxyInfo, Opts).
+
+get_proxy_info(Ref, #{proxy_header := true}) ->
+	case ranch:recv_proxy_header(Ref, 1000) of
+		{ok, ProxyInfo} -> ProxyInfo;
+		{error, closed} -> exit({shutdown, closed})
+	end;
+get_proxy_info(_, _) ->
+	undefined.

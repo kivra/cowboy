@@ -1,4 +1,4 @@
-%% Copyright (c) 2017, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) Loïc Hoguin <essen@ninenines.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
 %% purpose with or without fee is hereby granted, provided that the above
@@ -29,13 +29,15 @@ suite() ->
 %% We initialize trace patterns here. Appropriate would be in
 %% init_per_suite/1, but this works just as well.
 all() ->
-	case code:is_module_native(?MODULE) of
-		true ->
-			{skip, "The Cowboy tracer is not compatible with native code."};
-		false ->
-			cowboy_tracer_h:set_trace_patterns(),
-			cowboy_test:common_all()
-	end.
+	%% @todo Implement these tests for HTTP/3.
+	cowboy_test:common_all() -- [{group, h3}, {group, h3_compress}].
+
+init_per_suite(Config) ->
+	cowboy_tracer_h:set_trace_patterns(),
+	Config.
+
+end_per_suite(_) ->
+	ok.
 
 %% We want tests for each group to execute sequentially
 %% because we need to modify the protocol options. Groups

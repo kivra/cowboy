@@ -1,4 +1,4 @@
-%% Copyright (c) 2018, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) Loïc Hoguin <essen@ninenines.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
 %% purpose with or without fee is hereby granted, provided that the above
@@ -50,6 +50,7 @@ init_dispatch(Name) ->
 		{"/init", ws_init_commands_h, RunOrHibernate},
 		{"/handle", ws_handle_commands_h, RunOrHibernate},
 		{"/info", ws_info_commands_h, RunOrHibernate},
+		{"/trap_exit", ws_init_h, RunOrHibernate},
 		{"/active", ws_active_commands_h, RunOrHibernate},
 		{"/deflate", ws_deflate_commands_h, RunOrHibernate},
 		{"/set_options", ws_set_options_commands_h, RunOrHibernate},
@@ -211,6 +212,13 @@ do_many_frames_then_close_frame(Config, Path) ->
 	{ok, close} = receive_ws(ConnPid, StreamRef),
 	gun_down(ConnPid).
 
+websocket_init_trap_exit_false(Config) ->
+	doc("The trap_exit process flag must be set back to false before "
+		"the connection is taken over by Websocket."),
+	{ok, ConnPid, StreamRef} = gun_open_ws(Config, "/trap_exit?reply_trap_exit", []),
+	{ok, {text, <<"trap_exit: false">>}} = receive_ws(ConnPid, StreamRef),
+	ok.
+
 websocket_active_false(Config) ->
 	doc("The {active, false} command stops receiving data from the socket. "
 		"The {active, true} command reenables it."),
@@ -281,6 +289,41 @@ websocket_set_options_idle_timeout(Config) ->
 	%% Trigger the change in idle_timeout and confirm that
 	%% the connection gets closed soon after.
 	gun:ws_send(ConnPid, StreamRef, {text, <<"idle_timeout_short">>}),
+	receive
+		{gun_down, ConnPid, _, _, _} ->
+			ok
+	after 2000 ->
+		error(timeout)
+	end.
+
+websocket_set_options_max_frame_size(Config) ->
+	doc("The max_frame_size option can be modified using the "
+		"command {set_options, Opts} at runtime."),
+	ConnPid = gun_open(Config),
+	StreamRef = gun:ws_upgrade(ConnPid, "/set_options"),
+	receive
+		{gun_upgrade, ConnPid, StreamRef, [<<"websocket">>], _} ->
+			ok;
+		{gun_response, ConnPid, _, _, Status, Headers} ->
+			exit({ws_upgrade_failed, Status, Headers});
+		{gun_error, ConnPid, StreamRef, Reason} ->
+			exit({ws_upgrade_failed, Reason})
+	after 1000 ->
+		error(timeout)
+	end,
+	%% We first send a 1MB frame to confirm that yes, we can
+	%% send a frame that large. The default max_frame_size is infinity.
+	gun:ws_send(ConnPid, StreamRef, {binary, <<0:8000000>>}),
+	{ws, {binary, <<0:8000000>>}} = gun:await(ConnPid, StreamRef),
+	%% Trigger the change in max_frame_size. From now on we will
+	%% only allow frames of up to 1000 bytes.
+	gun:ws_send(ConnPid, StreamRef, {text, <<"max_frame_size_small">>}),
+	%% Confirm that we can send frames of up to 1000 bytes.
+	gun:ws_send(ConnPid, StreamRef, {binary, <<0:8000>>}),
+	{ws, {binary, <<0:8000>>}} = gun:await(ConnPid, StreamRef),
+	%% Confirm that sending frames larger than 1000 bytes
+	%% results in the closing of the connection.
+	gun:ws_send(ConnPid, StreamRef, {binary, <<0:8008>>}),
 	receive
 		{gun_down, ConnPid, _, _, _} ->
 			ok

@@ -1,4 +1,4 @@
-%% Copyright (c) 2017, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) Loïc Hoguin <essen@ninenines.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
 %% purpose with or without fee is hereby granted, provided that the above
@@ -23,12 +23,20 @@
 %% ct.
 
 all() ->
-	[
+	All = [
 		{group, http_compress},
 		{group, https_compress},
 		{group, h2_compress},
-		{group, h2c_compress}
-	].
+		{group, h2c_compress},
+		{group, h3_compress}
+	],
+	%% Don't run HTTP/3 tests on Windows for now.
+	case os:type() of
+		{win32, _} ->
+			All -- [{group, h3_compress}];
+		_ ->
+			All
+	end.
 
 groups() ->
 	cowboy_test:common_groups(ct_helper:all(?MODULE)).
@@ -37,7 +45,7 @@ init_per_group(Name, Config) ->
 	cowboy_test:init_common_groups(Name, Config, ?MODULE).
 
 end_per_group(Name, _) ->
-	cowboy:stop_listener(Name).
+	cowboy_test:stop_group(Name).
 
 %% Routes.
 
@@ -67,7 +75,7 @@ gzip_accept_encoding_malformed(Config) ->
 	{200, Headers, _} = do_get("/reply/large",
 		[{<<"accept-encoding">>, <<";">>}], Config),
 	false = lists:keyfind(<<"content-encoding">>, 1, Headers),
-	false = lists:keyfind(<<"vary">>, 1, Headers),
+	{_, <<"accept-encoding">>} = lists:keyfind(<<"vary">>, 1, Headers),
 	{_, <<"100000">>} = lists:keyfind(<<"content-length">>, 1, Headers),
 	ok.
 
@@ -76,7 +84,7 @@ gzip_accept_encoding_missing(Config) ->
 	{200, Headers, _} = do_get("/reply/large",
 		[], Config),
 	false = lists:keyfind(<<"content-encoding">>, 1, Headers),
-	false = lists:keyfind(<<"vary">>, 1, Headers),
+	{_, <<"accept-encoding">>} = lists:keyfind(<<"vary">>, 1, Headers),
 	{_, <<"100000">>} = lists:keyfind(<<"content-length">>, 1, Headers),
 	ok.
 
@@ -85,7 +93,7 @@ gzip_accept_encoding_no_gzip(Config) ->
 	{200, Headers, _} = do_get("/reply/large",
 		[{<<"accept-encoding">>, <<"compress">>}], Config),
 	false = lists:keyfind(<<"content-encoding">>, 1, Headers),
-	false = lists:keyfind(<<"vary">>, 1, Headers),
+	{_, <<"accept-encoding">>} = lists:keyfind(<<"vary">>, 1, Headers),
 	{_, <<"100000">>} = lists:keyfind(<<"content-length">>, 1, Headers),
 	ok.
 
@@ -94,7 +102,7 @@ gzip_accept_encoding_not_supported(Config) ->
 	{200, Headers, _} = do_get("/reply/large",
 		[{<<"accept-encoding">>, <<"application/gzip">>}], Config),
 	false = lists:keyfind(<<"content-encoding">>, 1, Headers),
-	false = lists:keyfind(<<"vary">>, 1, Headers),
+	{_, <<"accept-encoding">>} = lists:keyfind(<<"vary">>, 1, Headers),
 	{_, <<"100000">>} = lists:keyfind(<<"content-length">>, 1, Headers),
 	ok.
 
@@ -105,7 +113,18 @@ gzip_reply_content_encoding(Config) ->
 	%% We set the content-encoding to compress; without actually compressing.
 	{_, <<"compress">>} = lists:keyfind(<<"content-encoding">>, 1, Headers),
 	%% The reply didn't include a vary header.
-	false = lists:keyfind(<<"vary">>, 1, Headers),
+	{_, <<"accept-encoding">>} = lists:keyfind(<<"vary">>, 1, Headers),
+	{_, <<"100000">>} = lists:keyfind(<<"content-length">>, 1, Headers),
+	ok.
+
+gzip_reply_etag(Config) ->
+	doc("Reply with etag header; get an uncompressed response."),
+	{200, Headers, _} = do_get("/reply/etag",
+		[{<<"accept-encoding">>, <<"gzip">>}], Config),
+	%% We set a strong etag.
+	{_, <<"\"STRONK\"">>} = lists:keyfind(<<"etag">>, 1, Headers),
+	%% The reply didn't include a vary header.
+	{_, <<"accept-encoding">>} = lists:keyfind(<<"vary">>, 1, Headers),
 	{_, <<"100000">>} = lists:keyfind(<<"content-length">>, 1, Headers),
 	ok.
 
@@ -125,7 +144,7 @@ gzip_reply_sendfile(Config) ->
 	{200, Headers, Body} = do_get("/reply/sendfile",
 		[{<<"accept-encoding">>, <<"gzip">>}], Config),
 	false = lists:keyfind(<<"content-encoding">>, 1, Headers),
-	false = lists:keyfind(<<"vary">>, 1, Headers),
+	{_, <<"accept-encoding">>} = lists:keyfind(<<"vary">>, 1, Headers),
 	ct:log("Body received:~n~p~n", [Body]),
 	ok.
 
@@ -134,7 +153,7 @@ gzip_reply_small_body(Config) ->
 	{200, Headers, _} = do_get("/reply/small",
 		[{<<"accept-encoding">>, <<"gzip">>}], Config),
 	false = lists:keyfind(<<"content-encoding">>, 1, Headers),
-	false = lists:keyfind(<<"vary">>, 1, Headers),
+	{_, <<"accept-encoding">>} = lists:keyfind(<<"vary">>, 1, Headers),
 	{_, <<"100">>} = lists:keyfind(<<"content-length">>, 1, Headers),
 	ok.
 
@@ -170,7 +189,16 @@ gzip_stream_reply_content_encoding(Config) ->
 	{200, Headers, Body} = do_get("/stream_reply/content-encoding",
 		[{<<"accept-encoding">>, <<"gzip">>}], Config),
 	{_, <<"compress">>} = lists:keyfind(<<"content-encoding">>, 1, Headers),
-	false = lists:keyfind(<<"vary">>, 1, Headers),
+	{_, <<"accept-encoding">>} = lists:keyfind(<<"vary">>, 1, Headers),
+	100000 = iolist_size(Body),
+	ok.
+
+gzip_stream_reply_etag(Config) ->
+	doc("Stream reply with etag header; get an uncompressed response."),
+	{200, Headers, Body} = do_get("/stream_reply/etag",
+		[{<<"accept-encoding">>, <<"gzip">>}], Config),
+	{_, <<"\"STRONK\"">>} = lists:keyfind(<<"etag">>, 1, Headers),
+	{_, <<"accept-encoding">>} = lists:keyfind(<<"vary">>, 1, Headers),
 	100000 = iolist_size(Body),
 	ok.
 

@@ -1,4 +1,4 @@
-%% Copyright (c) 2017, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) Loïc Hoguin <essen@ninenines.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
 %% purpose with or without fee is hereby granted, provided that the above
@@ -32,7 +32,7 @@ init_per_group(Name, Config) ->
 	cowboy_test:init_common_groups(Name, Config, ?MODULE).
 
 end_per_group(Name, _) ->
-	cowboy:stop_listener(Name).
+	cowboy_test:stop_group(Name).
 
 %% Dispatch configuration.
 
@@ -85,7 +85,7 @@ accept_callback_missing(Config) ->
 		{<<"accept-encoding">>, <<"gzip">>},
 		{<<"content-type">>, <<"text/plain">>}
 	], <<"Missing!">>),
-	{response, fin, 500, _} = gun:await(ConnPid, Ref),
+	{response, fin, 500, _} = do_maybe_h3_error(gun:await(ConnPid, Ref)),
 	ok.
 
 accept_callback_patch_false(Config) ->
@@ -127,7 +127,7 @@ do_accept_callback_true(Config, Fun) ->
 	ok.
 
 charset_in_content_types_provided(Config) ->
-	doc("When a charset is matched explictly in content_types_provided, "
+	doc("When a charset is matched explicitly in content_types_provided, "
 		"that charset is used and the charsets_provided callback is ignored."),
 	ConnPid = gun_open(Config),
 	Ref = gun:get(ConnPid, "/charset_in_content_types_provided", [
@@ -404,6 +404,18 @@ content_types_accepted_wildcard_param_content_type_with_param(Config) ->
 	{response, fin, 204, _} = gun:await(ConnPid, Ref),
 	ok.
 
+content_types_provided_invalid_type(Config) ->
+	doc("When an invalid type is returned from the "
+		"content_types_provided callback, the "
+		"resource is incorrect and a 500 response is expected."),
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, "/content_types_provided?invalid-type", [
+		{<<"accept">>, <<"*/*">>},
+		{<<"accept-encoding">>, <<"gzip">>}
+	]),
+	{response, _, 500, _} = do_maybe_h3_error(gun:await(ConnPid, Ref)),
+	ok.
+
 content_types_provided_wildcard_param_no_accept_param(Config) ->
 	doc("When a wildcard is returned for parameters from the "
 		"content_types_provided callback, an accept header "
@@ -472,7 +484,7 @@ delete_resource_missing(Config) ->
 	Ref = gun:delete(ConnPid, "/delete_resource?missing", [
 		{<<"accept-encoding">>, <<"gzip">>}
 	]),
-	{response, _, 500, _} = gun:await(ConnPid, Ref),
+	{response, _, 500, _} = do_maybe_h3_error(gun:await(ConnPid, Ref)),
 	ok.
 
 create_resource_created(Config) ->
@@ -571,6 +583,17 @@ generate_etag_missing(Config) ->
 	false = lists:keyfind(<<"etag">>, 1, Headers),
 	ok.
 
+generate_etag_undefined(Config) ->
+	doc("The etag header must not be sent when "
+		"the generate_etag callback returns undefined."),
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, "/generate_etag?undefined", [
+		{<<"accept-encoding">>, <<"gzip">>}
+	]),
+	{response, _, 200, Headers} = gun:await(ConnPid, Ref),
+	false = lists:keyfind(<<"etag">>, 1, Headers),
+	ok.
+
 generate_etag_binary_strong(Config) ->
 	doc("The etag header must be sent when the generate_etag "
 		"callback returns a strong binary. (RFC7232 2.3)"),
@@ -639,9 +662,15 @@ do_generate_etag(Config, Qs, ReqHeaders, Status, Etag) ->
 		{<<"accept-encoding">>, <<"gzip">>}
 		|ReqHeaders
 	]),
-	{response, _, Status, RespHeaders} = gun:await(ConnPid, Ref),
+	{response, _, Status, RespHeaders} = do_maybe_h3_error(gun:await(ConnPid, Ref)),
 	Etag = lists:keyfind(<<"etag">>, 1, RespHeaders),
 	ok.
+
+%% See do_maybe_h3_error2 comment.
+do_maybe_h3_error({error, {stream_error, {stream_error, h3_internal_error, _}}}) ->
+	{response, fin, 500, []};
+do_maybe_h3_error(Result) ->
+	Result.
 
 if_range_etag_equal(Config) ->
 	doc("When the if-range header matches, a 206 partial content "
@@ -788,6 +817,7 @@ provide_callback(Config) ->
 	]),
 	{response, nofin, 200, Headers} = gun:await(ConnPid, Ref),
 	{_, <<"text/plain">>} = lists:keyfind(<<"content-type">>, 1, Headers),
+	{_, <<"HEAD, GET, OPTIONS">>} = lists:keyfind(<<"allow">>, 1, Headers),
 	{ok, <<"This is REST!">>} = gun:await_body(ConnPid, Ref),
 	ok.
 
@@ -795,7 +825,7 @@ provide_callback_missing(Config) ->
 	doc("A 500 response must be sent when the ProvideCallback can't be called."),
 	ConnPid = gun_open(Config),
 	Ref = gun:get(ConnPid, "/provide_callback_missing", [{<<"accept-encoding">>, <<"gzip">>}]),
-	{response, fin, 500, _} = gun:await(ConnPid, Ref),
+	{response, fin, 500, _} = do_maybe_h3_error(gun:await(ConnPid, Ref)),
 	ok.
 
 provide_range_callback(Config) ->
@@ -951,7 +981,7 @@ provide_range_callback_missing(Config) ->
 		{<<"accept-encoding">>, <<"gzip">>},
 		{<<"range">>, <<"bytes=0-">>}
 	]),
-	{response, fin, 500, _} = gun:await(ConnPid, Ref),
+	{response, fin, 500, _} = do_maybe_h3_error(gun:await(ConnPid, Ref)),
 	ok.
 
 range_ignore_unknown_unit(Config) ->
